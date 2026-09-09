@@ -1,0 +1,10 @@
+# Parse 10M PBMC cytokine atlas -- 18 cell types conditioned on, 4 of 12 DONORS held
+# out (30% of their cytokines leaked back), PBS control.
+data:
+  batch_size: 512
+train:
+  max_steps: 60000
+  stage1_steps: 30000
+  stage2_steps: 30000
+eval:
+  max_groups: 300

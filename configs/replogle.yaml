@@ -1,0 +1,10 @@
+# Replogle (Nadig) CRISPRi -- 643k cells, 4 cell lines, 2,023 targets.
+# Held-out context: hepg2, with 30% of its perturbations leaked back into train.
+data:
+  batch_size: 512
+train:
+  max_steps: 40000
+  stage1_steps: 20000
+  stage2_steps: 20000
+eval:
+  max_groups: 300

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+logs/
+*.out
+*.log
+*.h5ad
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.pkl
+.vscode/
+.idea/
+.DS_Store

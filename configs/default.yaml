@@ -1,0 +1,119 @@
+# ============================================================================
+# PerturbEnergy -- defaults for every dataset. `configs/<dataset>.yaml` overrides
+# only what differs; `--set a.b=c` overrides anything from the command line.
+#
+#   x    log1p(CP10K) expression on 2,000 HVGs      c   cellular context
+#   a    perturbation label                         z_b basal state    z_a perturbation repr
+# ============================================================================
+
+data:
+  batch_size: 512             # total cells per step = n_conditions * set_size
+  set_size: 32                # cells per (context, perturbation) block in a batch, so the
+                              # reconstruction term can be a distance between POPULATIONS
+  gpu_resident: true          # keep the whole expression matrix on the GPU when it fits
+  gpu_budget_gb: 40.0
+
+model:
+  use_energy: true            # false -> ablation: the same VAE with no energy at all
+  use_context: true           # false -> ablation: z_b sees x only, no context embedding
+
+  # ONE width for the two embedding tables, every MLP trunk and both latents.
+  d_model: 512
+  z_b_dim: null               # null -> d_model
+  z_a_dim: null               # null -> d_model
+
+  x_hidden:   [1024]          # basal encoder: 2000 -> 1024 -> d_model
+  enc_hidden: [512, 512]      # the 2-layer trunk before each Gaussian head
+  dec_hidden: [1024]          # generator: d_model -> 1024 -> 2000
+  combine: add                # add | concat -- how (z_b, z_a) enter the generator
+
+  dropout: 0.1
+  norm: layer                 # layer | batch | none
+  act: silu
+  logvar_min: -6.0            # posterior std floor exp(-3) = 0.05
+  logvar_max: 4.0
+
+  # Energy-based selection of z_a in the forward pass (paper's Inference step iii).
+  # n_candidates: 1 = plain sampling; >1 = draw that many and keep the lowest-energy one.
+  n_candidates: 1
+  select_mode: min            # min | softmax
+  select_tau: 1.0
+  candidate_std_scale: 1.0    # widen candidate sampling so the energy has real choices
+
+  energy:
+    kind: mlp_cos             # mlp_cos = 2-layer MLP on z_a then cosine with u_a (default)
+                              # cos     = cosine directly (no parameters of its own)
+                              # mlp     = MLP([z_a,u_a]) -> scalar (unbounded)
+    hidden: [512]             # the MLP's hidden widths (width-preserving by default)
+    dropout: 0.0
+    use_z_b: false            # true -> E(z_a, z_b, a), the full conditioning of Eq. 4
+    scale: 1.0                # multiplies the similarity (sharper energy)
+
+loss:
+  # --- pairing: control (the default) -- unpaired population reconstruction ---
+  set_recon: mean+mmd         # mean | mmd | mean+mmd. 'mean' is the squared error of the
+                              # condition MEANS, 'mmd' the paper's population term.
+  var_weight: 0.0             # extra ||std(pred)-std(real)||^2 term (the MMD covers it)
+  # --- pairing: observed -- per-cell reconstruction of the input cell ---
+  recon: mse+mmd              # mse | mmd | mse+mmd
+  recon_reduce: sum           # sum = per-cell SSE over genes (Gaussian log-lik scale)
+  # --- shared ---
+  mmd_weight: 1.0
+  recon_group_size: 64        # pairing='observed': MMD within groups of this many cells
+  mmd_scales: [1.0, 2.0, 5.0, 10.0, 20.0]
+
+  beta_kl_b: 5.0e-5           # deliberately small (scGen scale), as specified
+  beta_kl_a: 5.0e-5
+  kl_warmup: 5000
+
+  negatives: langevin         # langevin | mismatch | both   (see trainer.py)
+  energy_update: alternating  # alternating = Algorithm 1's two phases | joint
+  energy_weight: 1.0          # weight of the energy term inside L_ELBO
+  energy_term: hinge          # hinge | raw | none -- the E_q[E_alpha] term of Eq. 16 on
+                              # the VAE side. 'raw' is literal but unbounded below.
+
+langevin:                     # negative sampling from p_alpha(z_a|z_b,a), Eq. 13-15
+  init: noise                 # noise = p_0 = N(0,I) (Algorithm 1 line 2)
+                              # pert_emb = another perturbation's embedding (harder)
+                              # batch_z_a = another cell's z_a
+  steps: 20                   # K
+  step_size: 0.1              # eta
+  noise_scale: 1.0            # multiplier on sqrt(eta)*eps (0 = deterministic descent)
+  noise_decay: linear         # none | linear | cosine -- anneal so a short chain settles
+  clamp: 10.0                 # clamp |z_a| along the chain (0 = off)
+
+optim:
+  name: adamw                 # adamw | adam
+  vae_lr: 1.0e-3              # {theta, phi_b, phi_a} and the embedding tables
+  energy_lr: 1.0e-4           # alpha -- 10x slower, standard EBM practice
+  weight_decay: 1.0e-6
+  grad_clip: 5.0
+  use_margin: true            # hinge max(0, margin + E+ - E-) instead of a raw difference
+  margin: 0.2                 # cosine energies live in [-1,1]; 1.0 is already extreme
+  energy_l2_reg: 1.0e-3       # keeps |E| near 0 (essential for kind='mlp')
+
+train:
+  pairing: control            # control  = feed a CONTROL cell, predict the PERTURBED
+                              #            population (the task; the paper's Inference)
+                              # observed = reconstruct the observed cell (Eq. 7 literally;
+                              #            a better autoencoder, a much worse predictor)
+  mode: joint                 # joint | finetune (VAE first, then add the energy)
+  max_steps: 30000            # joint mode
+  stage1_steps: 15000         # finetune mode: plain VAE
+  stage2_steps: 15000         # finetune mode: + energy
+  log_every: 500
+  eval_every: 2500
+  seed: 0
+  out_dir: null               # null -> $PE_MODELS_ROOT/<run name>
+
+eval:
+  split: test
+  min_cells: 30               # smallest (context, perturbation) group scored
+  max_groups: 200             # score the N largest groups
+  n_ctrl: 300                 # control cells fed to the model per group
+  m_samples: 16               # M candidate z_a per cell; the lowest-energy one is kept
+  de_ks: [50, 100, 200]       # the DEG group the report asks for
+  de_method: wilcoxon         # wilcoxon | delta -- how the true DE genes are ranked
+  top_k: 50                   # DE set size for DEPrec / DERec / DEOverlap
+  distribution: true          # energy distance / MMD / Sinkhorn between populations
+  seed: 0

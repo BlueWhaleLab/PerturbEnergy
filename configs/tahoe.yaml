@@ -1,0 +1,10 @@
+# Tahoe-100M drug screen -- 50 cell lines, 1,137 drugs, DMSO_TF control.
+# Held out: 5 cell lines chosen by PCA on the pseudobulk profiles, 30% leak.
+data:
+  batch_size: 512
+train:
+  max_steps: 60000
+  stage1_steps: 30000
+  stage2_steps: 30000
+eval:
+  max_groups: 300

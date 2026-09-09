@@ -1,0 +1,14 @@
+# Norman2019 CRISPRa -- one context (K562), so the hold-out is on PERTURBATIONS
+# (30% never seen in training). The smallest dataset here: fewer steps, and the
+# perturbation table is small enough that a wider margin is safe.
+data:
+  batch_size: 256
+train:
+  max_steps: 20000
+  stage1_steps: 10000
+  stage2_steps: 10000
+model:
+  use_context: false          # a single cell line: the context table would be constant
+eval:
+  min_cells: 20
+  max_groups: 200
