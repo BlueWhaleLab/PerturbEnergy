@@ -1,0 +1,20 @@
+# Full Tahoe-100M: 95,624,334 cells x 2,000 genes, memory-mapped (765 GB on disk).
+#     python -m perturbenergy.data.prepare --dataset tahoe --backend memmap --tag full \
+#            --cap_per_group 0 --cap_control 0
+#     python scripts/train.py --dataset tahoe --config configs/tahoe_full.yaml \
+#            --path $PE_PREPPED/tahoe_full --run tahoe_full_<variant> --evaluate
+#
+# ~1,317 perturbations x 50 cell lines is ~66k trainable conditions, 3.7x the capped
+# build, so the capped run's 60k steps would give each condition only ~15 draws against
+# the ~54 it had there. `max_steps` is set from a measured step time -- run
+# scripts/probe_memmap.py first; the value below is a placeholder to be overridden with
+# --set train.max_steps=N.
+data:
+  batch_size: 512
+  gpu_resident: false          # a memmap never goes resident; batches still land on cuda
+train:
+  max_steps: 60000
+  stage1_steps: 30000
+  stage2_steps: 30000
+eval:
+  max_groups: 300

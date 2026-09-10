@@ -4,6 +4,8 @@ only way the numbers compare.
 
     groups        (context, perturbation) pairs in the TEST split with >= min_cells cells,
                   the control perturbation excluded; the largest `max_groups` are scored.
+                  Perturbations that cannot be embedded from targets seen in training are
+                  dropped for EVERY predictor, so all columns are scored on one set.
     input         the control population of the SAME context -- and, where the split is
                   taken on another column (PBMC holds out DONORS while the model conditions
                   on CELL TYPE), of the same held-out donors. That is what a virtual cell
@@ -33,7 +35,7 @@ from .predictors import build_predictor
 
 def evaluate(data, predictor, *, split="test", min_cells=30, max_groups=200, n_ctrl=300,
              de_ks=(50, 100, 200), de_method="wilcoxon", top_k=50, distribution=True,
-             seed=0, verbose=True):
+             seed=0, verbose=True, require_predictable=True):
     """-> (summary dict, per-group rows)."""
     X, obs = data.X_np, data.obs
     is_tr = data.split == "train"
@@ -52,6 +54,14 @@ def evaluate(data, predictor, *, split="test", min_cells=30, max_groups=200, n_c
     rows, dp, dr, skipped = [], [], [], []
     t0 = time.time()
     for gi, (ctx, prt, n_real) in enumerate(groups):
+        # Whether a perturbation is embeddable at all is a property of the SPLIT, not of
+        # the predictor: its targets simply never occur in training. Drop those groups for
+        # everyone, otherwise `control` and `mean_shift` -- which need no embedding -- get
+        # scored on a larger, different set of conditions than the models, and the columns
+        # are no longer comparable.
+        if require_predictable and not data.pert_predictable[data.a2i[prt]]:
+            skipped.append(f"{ctx}|{prt} (not embeddable from training targets)")
+            continue
         if not predictor.can_predict(ctx, prt):
             skipped.append(f"{ctx}|{prt}")
             continue

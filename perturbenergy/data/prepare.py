@@ -15,6 +15,7 @@ below; the command line overrides them.
 """
 import argparse
 import glob
+import json
 import os
 import sys
 import time
@@ -243,6 +244,183 @@ def read_pbmc(s, args):
     return Xd, O, genes[gene_idx], s["control"]
 
 
+def stream_tahoe_memmap(s, args, out_dir):
+    """Prepare FULL Tahoe-100M without ever holding it in memory.
+
+    101M cells x 2,000 genes of float32 is 808 GB, so the matrix is written straight to a
+    raw `X.f32` on disk and later opened with np.memmap. Two passes over the shards:
+
+      pass 1  read only the (cell_line, drug) columns -- cheap, a few seconds per hundred
+              shards -- to size every group after the caps and so the final row count.
+      pass 2  read the expression lists, keep the 2,000 panel genes, log-normalise, and
+              append the rows in shard order. Sequential writes; the per-cell-line sums
+              are accumulated on the way so the held-out cell lines can be chosen by the
+              paper's PCA procedure without a third pass.
+
+    The split is then computed on the obs columns alone. Output is a directory
+    (X.f32 + obs.parquet + meta.json) that data.loader.PerturbData opens memory-mapped.
+    """
+    import pyarrow.parquet as pq
+    import scipy.sparse as sp
+
+    from .splits import select_holdout_pca_pb
+
+    meta_p = os.path.join(P.TAHOE_DIR, "metadata", "gene_metadata.parquet")
+    gm = pq.read_table(meta_p).to_pandas()
+    n_vocab = int(gm.token_id.max()) + 1
+    panel = set(load_panel(s) or [])
+    sym2tok = {str(a): int(b) for a, b in zip(gm.gene_symbol, gm.token_id)}
+    toks = np.array(sorted({sym2tok[g] for g in panel if g in sym2tok}))
+    syms = gm.set_index("token_id").loc[toks, "gene_symbol"].astype(str).values
+    G = len(toks)
+
+    shards = sorted(glob.glob(os.path.join(s["path"], "*.parquet")))
+    np.random.default_rng(args.seed).shuffle(shards)
+    if getattr(args, "max_shards", 0):
+        shards = shards[: args.max_shards]
+    ctx_col, prt_col, ctl = s["context"], s["pert"], s["control"]
+    dose_col = s.get("dose_col")
+    read_cols = [ctx_col, prt_col] + ([dose_col] if dose_col else [])
+    cap_g = args.cap_per_group or (1 << 62)
+    cap_c = args.cap_control or (1 << 62)
+    print(f"[tahoe] {len(shards)} shards | panel {G} genes | caps {cap_g}/{cap_c}",
+          flush=True)
+
+    # ---- pass 1: how many rows survive the caps -------------------------------- #
+    # ---- pass 0: the (drug, dose) vocabulary ----------------------------------- #
+    # A perturbation is a drug AT A DOSE. Reading two small columns over every shard
+    # costs under a minute and is what lets pass 1 count the real groups.
+    lab_of = None
+    if dose_col:
+        t0, pairs = time.time(), set()
+        for path in shards:
+            t = pq.read_table(path, columns=[prt_col, dose_col])
+            pairs.update(zip(t[prt_col].to_pandas().astype(str).values,
+                             t[dose_col].to_pandas().astype(str).values))
+        lab_of = {}
+        for d in sorted({d for d, _ in pairs}):
+            ss = sorted(x for dd, x in pairs if dd == d)
+            for j, x in enumerate(ss, 1):
+                lab_of[x] = ctl if d == ctl else f"{d}@{j}"
+        print(f"[tahoe] pass0: {len({d for d, _ in pairs})} drugs x doses -> "
+              f"{len(set(lab_of.values()))} perturbations ({time.time()-t0:.0f}s)",
+              flush=True)
+
+    def labels_of(tbl):
+        dr = tbl[prt_col].to_pandas().astype(str).values
+        if lab_of is None:
+            return dr, dr
+        sm = tbl[dose_col].to_pandas().astype(str).values
+        return np.array([lab_of[x] for x in sm]), dr
+
+    t0, seen, N = time.time(), {}, 0
+    lines, drugs = set(), set()
+    for i, path in enumerate(shards):
+        t = pq.read_table(path, columns=read_cols)
+        cl = t[ctx_col].to_pandas().astype(str).values
+        dr, _ = labels_of(t)
+        lines.update(np.unique(cl).tolist()); drugs.update(np.unique(dr).tolist())
+        for k, c in pd.Series(map("|".join, zip(cl, dr))).value_counts().items():
+            cap = cap_c if k.rsplit("|", 1)[1] == ctl else cap_g
+            room = max(0, cap - seen.get(k, 0))
+            add = min(int(c), room)
+            seen[k] = seen.get(k, 0) + add
+            N += add
+        if i % 250 == 0:
+            print(f"  [pass1] {i}/{len(shards)} rows so far {N:,} "
+                  f"({time.time()-t0:.0f}s)", flush=True)
+    # obs is carried as int32 codes, not strings: 101M Python str objects per column is
+    # ~10 GB of pointers and objects each, and writing that to parquet is worse.
+    LN = np.array(sorted(lines)); DR = np.array(sorted(drugs))
+    print(f"[tahoe] pass1: {N:,} rows in {len(seen):,} groups | "
+          f"{len(LN)} cell lines, {len(DR)} perturbations -> "
+          f"{N * G * 4 / 1e9:.0f} GB on disk ({time.time()-t0:.0f}s)", flush=True)
+
+    # ---- pass 2: write the matrix ---------------------------------------------- #
+    os.makedirs(out_dir, exist_ok=True)
+    xpath = os.path.join(out_dir, "X.f32")
+    X = np.memmap(xpath, np.float32, "w+", shape=(N, G))
+    seen, pos, C, Pp, DG = {}, 0, [], [], []
+    pb_sum, pb_n = {}, {}
+    t0 = time.time()
+    for i, path in enumerate(shards):
+        tbl = pq.read_table(path, columns=["genes", "expressions"] + read_cols)
+        cl = tbl[ctx_col].to_pandas().astype(str).values
+        dr, raw_drug = labels_of(tbl)
+        take = []
+        for j in range(len(cl)):
+            k = cl[j] + "|" + dr[j]
+            cap = cap_c if dr[j] == ctl else cap_g
+            if seen.get(k, 0) < cap:
+                seen[k] = seen.get(k, 0) + 1
+                take.append(j)
+        if take:
+            take = np.asarray(take)
+            ga = tbl["genes"].combine_chunks()
+            ea = tbl["expressions"].combine_chunks()
+            offs = np.asarray(ga.offsets)
+            M = sp.csr_matrix((np.clip(np.asarray(ea.values).astype(np.float32), 0, None),
+                               np.asarray(ga.values), offs),
+                              shape=(len(offs) - 1, n_vocab))
+            blk = M[take][:, toks].toarray().astype(np.float32)
+            blk = H.lognorm(blk)                      # per-cell: safe to do shard by shard
+            X[pos:pos + len(blk)] = blk
+            ct = cl[take]
+            for c in np.unique(ct):
+                m = ct == c
+                pb_sum[c] = pb_sum.get(c, 0.0) + blk[m].sum(0)
+                pb_n[c] = pb_n.get(c, 0) + int(m.sum())
+            C.append(np.searchsorted(LN, cl[take]).astype(np.int32))
+            Pp.append(np.searchsorted(DR, dr[take]).astype(np.int32))
+            if lab_of is not None:
+                DG.append(raw_drug[take])
+            pos += len(blk)
+        if i % 100 == 0:
+            el = time.time() - t0
+            print(f"  [pass2] {i}/{len(shards)} rows {pos:,}/{N:,} "
+                  f"({pos*G*4/1e9:.0f} GB, {el:.0f}s, eta {el/max(i,1)*(len(shards)-i)/60:.0f}m)",
+                  flush=True)
+    X.flush(); del X
+    print(f"[tahoe] pass2 done: {pos:,} rows written ({time.time()-t0:.0f}s)", flush=True)
+
+    cc, pc = np.concatenate(C), np.concatenate(Pp)
+    del C, Pp
+    assert len(cc) == pos
+
+    # ---- held-out cell lines: the paper's PCA on the streamed pseudobulk -------- #
+    names = np.array(sorted(pb_sum))
+    pb = np.stack([pb_sum[c] / max(pb_n[c], 1) for c in names])
+    held = select_holdout_pca_pb(pb, names, s.get("n_holdout", 5), args.seed)
+    print(f"[tahoe] PCA over {len(names)} cell lines -> held out {list(held)}", flush=True)
+
+    # make_split wants labels; LN/DR are small so expanding through the codes gives a
+    # compact fixed-width array rather than an object array of 101M Python strings
+    split, info = make_split(
+        LN[cc], DR[pc], ctl, "unseen_context", held_out=list(held),
+        leak_frac=(args.leak_frac if args.leak_frac is not None else s.get("leak_frac", .30)),
+        val_frac=args.val_frac, control_split=args.control_split, seed=args.seed)
+    O = pd.DataFrame({
+        "context": pd.Categorical.from_codes(cc, LN),
+        "pert": pd.Categorical.from_codes(pc, DR),
+        "split": pd.Categorical(split)})
+    if DG:                       # the drug behind each 'Drug@k', for aggregate analysis
+        O["drug"] = pd.Categorical(np.concatenate(DG))
+    print(f"[tahoe] split=unseen_context: " +
+          " ".join(f"{k}={v}" for k, v in info.items() if k in ("train", "val", "test")) +
+          f" | leaked perts {info.get('n_leaked_perts', 0)}", flush=True)
+
+    O.to_parquet(os.path.join(out_dir, "obs.parquet"), index=False)
+    json.dump({"n_cells": int(pos), "n_genes": int(G), "genes": [str(x) for x in syms],
+               "uns": {"dataset": "tahoe", "control": ctl, "n_genes": int(G),
+                       "split_kind": "unseen_context", "rescale": 1.0, "combo_sep": "",
+                       "source": str(s["path"]), "seed": int(args.seed),
+                       "split_info": {k: (list(v) if isinstance(v, (list, np.ndarray)) else v)
+                                      for k, v in info.items()}}},
+              open(os.path.join(out_dir, "meta.json"), "w"), indent=2, default=str)
+    print(f"[tahoe] wrote {out_dir}  X=({pos}, {G})  control={ctl!r}", flush=True)
+    return out_dir
+
+
 READERS = {"replogle": read_h5ad_generic, "norman": read_norman,
            "tahoe": read_tahoe, "pbmc": read_pbmc}
 
@@ -297,6 +475,12 @@ def main(argv=None):
     ap.add_argument("--val_frac", type=float, default=0.02)
     ap.add_argument("--control_split", default="train", choices=["train", "context"])
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--max_shards", type=int, default=0,
+                    help="tahoe: only use the first N shards (smoke-testing the stream)")
+    ap.add_argument("--backend", default="h5ad", choices=["h5ad", "memmap"],
+                    help="memmap: stream the matrix to a directory (X.f32 + obs.parquet + "
+                         "meta.json) instead of building it in RAM. Required for full "
+                         "Tahoe-100M, whose 101M x 2,000 float32 matrix is 808 GB.")
     args = ap.parse_args(argv)
 
     s = spec(args.dataset)
@@ -313,6 +497,12 @@ def main(argv=None):
     for k in ("cap_per_group", "cap_control", "max_cells"):
         if getattr(args, k) is None:
             setattr(args, k, 0)
+
+    if args.backend == "memmap":
+        if args.dataset != "tahoe":
+            raise SystemExit("--backend memmap is only implemented for tahoe")
+        out = args.out or os.path.join(P.PREPPED, f"tahoe{'_' + args.tag if args.tag else ''}")
+        return stream_tahoe_memmap(s, args, out)
 
     X, O, genes, control = READERS[args.dataset](s, args)
     genes = np.asarray([str(g) for g in genes])

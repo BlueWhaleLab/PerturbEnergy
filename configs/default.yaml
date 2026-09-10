@@ -112,7 +112,7 @@ eval:
   max_groups: 200             # score the N largest groups
   n_ctrl: 300                 # control cells fed to the model per group
   m_samples: 16               # M candidate z_a per cell; the lowest-energy one is kept
-  de_ks: [50, 100, 200]       # the DEG group the report asks for
+  de_ks: [25, 50, 100, 200]       # the DEG group the report asks for
   de_method: wilcoxon         # wilcoxon | delta -- how the true DE genes are ranked
   top_k: 50                   # DE set size for DEPrec / DERec / DEOverlap
   distribution: true          # energy distance / MMD / Sinkhorn between populations

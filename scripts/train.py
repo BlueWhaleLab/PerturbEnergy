@@ -50,8 +50,13 @@ def main():
     if not os.path.exists(path):
         raise SystemExit(f"{path} missing -- run:\n  python -m perturbenergy.data.prepare "
                          f"--dataset {args.dataset}")
-    data = PerturbData(path, device="cuda" if cfg.data.gpu_resident else "cpu",
-                       gpu_budget_gb=cfg.data.gpu_budget_gb)
+    # `device` is where BATCHES land -- always the compute device. Whether the matrix
+    # itself goes resident on the GPU is a separate question, answered by the budget:
+    # gpu_resident=false just means "keep it off the card", not "hand the trainer CPU
+    # tensors while the model sits on cuda".
+    data = PerturbData(path, device=dev,
+                       gpu_budget_gb=(cfg.data.gpu_budget_gb
+                                      if cfg.data.gpu_resident else 0.0))
     data.save_vocab(os.path.join(out_dir, "vocab.json"))
     C.save(cfg, os.path.join(out_dir, "config_used.json"))
 

@@ -1,5 +1,12 @@
-# Tahoe-100M drug screen -- 50 cell lines, 1,137 drugs, DMSO_TF control.
+# Tahoe-100M drug screen -- 50 cell lines, DMSO_TF control.
 # Held out: 5 cell lines chosen by PCA on the pseudobulk profiles, 30% leak.
+#
+# A perturbation is a DRUG AT A DOSE, not a drug: the atlas screens 379 drugs at ~3
+# doses each (1,344 (drug, sample) pairs), and PerturbDiff's "#Perturbations 1,137"
+# counts those -- its wording is "drug treatment AND DOSAGE combinations". Pooling the
+# doses is not harmless: measured across 190 (cell line, drug) groups, the cosine between
+# the delta of one dose and another is 0.389 at the median, so different doses drive
+# partly different transcriptional programs.
 data:
   batch_size: 512
 train:

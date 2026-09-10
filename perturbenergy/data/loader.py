@@ -50,6 +50,26 @@ from ..models.pert_embedding import build_tables
 UNSEEN = -1
 
 
+def _labels(obs, col):
+    """obs[col] -> (values, codes, categories) without ever building an object array.
+
+    Returns the values as a fixed-width unicode array, which compares and sorts like the
+    old object array but costs a few bytes per cell instead of a pointer plus a Python
+    string. `codes`/`categories` let callers index a per-category lookup rather than walk
+    the cells.
+    """
+    s = obs[col]
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        # a filtered AnnData keeps categories no row uses any more; they would otherwise
+        # become phantom perturbation rows in the embedding table
+        s = s.cat.remove_unused_categories()
+        cats = s.cat.categories.to_numpy().astype(str)
+        codes = s.cat.codes.to_numpy()
+    else:
+        cats, codes = np.unique(s.to_numpy().astype(str), return_inverse=True)
+    return cats[codes], codes, cats
+
+
 class PerturbData:
     def __init__(self, path, device="cpu", gpu_budget_gb=40.0, verbose=True):
         self.memmap = os.path.isdir(path)
@@ -71,40 +91,55 @@ class PerturbData:
         self.control = str(self.uns["control"])
         self.dataset = str(self.uns.get("dataset", os.path.basename(path.rstrip("/"))))
         self.split_kind = str(self.uns.get("split_kind", "?"))
-        self.context = obs["context"].astype(str).values
-        self.pert = obs["pert"].astype(str).values
-        self.split = obs["split"].astype(str).values
-        self.split_on = (obs["split_on"].astype(str).values if "split_on" in obs
-                         else self.context)
+        # Labels are kept as (codes, categories). Full Tahoe is 101M rows, and expanding
+        # three label columns into Python str objects -- which `.astype(str)` does -- is
+        # ~30 GB and minutes of work before a single step runs. Every id below is built
+        # by indexing a small per-category lookup instead of looping over cells.
+        self.context, ctx_code, ctx_cat = _labels(obs, "context")
+        self.pert, prt_code, prt_cat = _labels(obs, "pert")
+        self.split, _, _ = _labels(obs, "split")
+        if "split_on" in obs:
+            self.split_on, self._unit_code, _ = _labels(obs, "split_on")
+        else:
+            self.split_on, self._unit_code = self.context, ctx_code
 
         tr = self.split == "train"
-        self.combo_sep = (str(A.uns.get("combo_sep", "")) or None)
-        self.c2i = {c: i for i, c in enumerate(sorted(set(self.context[tr])))}
-        self.cid = np.array([self.c2i.get(c, UNSEEN) for c in self.context], np.int64)
+        self.combo_sep = (str(self.uns.get("combo_sep", "")) or None)
+
+        # contexts: indexed from train only, everything else -> UNSEEN
+        tr_ctx = sorted(set(ctx_cat[np.unique(ctx_code[tr])].tolist()))
+        self.c2i = {c: i for i, c in enumerate(tr_ctx)}
+        ctx_lut = np.array([self.c2i.get(c, UNSEEN) for c in ctx_cat], np.int64)
+        self.cid = ctx_lut[ctx_code]
 
         # perturbations: labels over the whole file, targets learned from train only
-        self.labels = sorted(set(self.pert))
+        self.labels = sorted(prt_cat.tolist())
         self.a2i = {p: i for i, p in enumerate(self.labels)}
         self.i2a = {i: p for p, i in self.a2i.items()}
-        self.aid = np.array([self.a2i[p] for p in self.pert], np.int64)
+        self.aid = np.array([self.a2i[p] for p in prt_cat], np.int64)[prt_code]
+        tr_perts = set(prt_cat[np.unique(prt_code[tr])].tolist())
         train_targets = set()
-        for p in sorted(set(self.pert[tr])):
+        for p in sorted(tr_perts):
             train_targets.update(p.split(self.combo_sep) if self.combo_sep else [p])
         self.pert_tokens, self.pert_mask, self.pert_predictable, self.t2i = build_tables(
             self.labels, train_targets, self.combo_sep)
-        self.trainable_pert = np.array([p in set(self.pert[tr]) for p in self.labels])
+        self.trainable_pert = np.array([p in tr_perts for p in self.labels])
 
+        # `device` is where BATCHES land (the model's device); `store` is where the matrix
+        # lives. They used to be the same field, which silently handed the trainer CPU
+        # tensors as soon as the matrix could not go resident.
         gb = self.X_np.nbytes / 1e9
-        self.device = ("cuda" if (device == "cuda" and torch.cuda.is_available()
-                                  and not self.memmap and gb <= gpu_budget_gb) else "cpu")
-        # a memmap stays on disk: materialising it would defeat the point
-        self.X = None if self.memmap else torch.from_numpy(self.X_np).to(self.device)
+        self.device = "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+        gpu_ok = self.device == "cuda" and not self.memmap and gb <= gpu_budget_gb
+        self.store = "disk" if self.memmap else ("gpu" if gpu_ok else "cpu")
+        self.X = (None if self.memmap
+                  else torch.from_numpy(self.X_np).to("cuda" if gpu_ok else "cpu"))
         self.C = torch.from_numpy(self.cid).to(self.device)
         self.A = torch.from_numpy(self.aid).to(self.device)
         self.idx = {s: np.where(self.split == s)[0] for s in ("train", "val", "test")}
         if verbose:
             print(f"[data] {self.dataset}: {len(self.X_np)} cells x {self.n_genes} genes "
-                  f"({gb:.1f} GB {'memmapped' if self.memmap else 'on ' + self.device}) "
+                  f"({gb:.1f} GB, X on {self.store}, batches on {self.device}) "
                   f"| contexts {len(self.c2i)} "
                   f"| perts {len(self.a2i)} ({int(self.pert_predictable.sum())} "
                   f"embeddable from {len(self.t2i)} targets) | control={self.control!r} "
@@ -151,7 +186,8 @@ class PerturbData:
         """
         rows = np.asarray(rows)
         if not self.memmap:
-            return self.X[torch.from_numpy(rows).to(self.device)]
+            t = self.X[torch.from_numpy(rows).to(self.X.device)]
+            return t if t.device.type == self.device else t.to(self.device)
         order = np.argsort(rows, kind="stable")
         block = np.asarray(self.X_np[rows[order]], dtype=np.float32)
         back = np.empty_like(block)
@@ -284,26 +320,42 @@ class ConditionSampler:
         #
         # Grouped with pandas rather than a mask per group: Tahoe has 19,000 conditions
         # over 1.9M cells, and one boolean scan each would be an hour of set-up.
+        # Grouped on INTEGER codes, not label strings. Full Tahoe is 95.6M rows and
+        # ~66k conditions; a three-string DataFrame over that is tens of GB and its
+        # groupby is minutes, whereas one composite int64 key sorts in seconds.
         by_unit = not data.split_on_is_context
-        unit = data.split_on if by_unit else data.context
-        df = pd.DataFrame({"ctx": data.context[rows], "u": unit[rows],
-                           "p": data.pert[rows]}, index=rows)
-        target = df.groupby(["ctx", "u", "p"], sort=False).indices     # -> positions in df
+        unit_code = data._unit_code
+        n_u, n_p = int(unit_code.max()) + 1, int(data.aid.max()) + 1
+        ctl_id = data.a2i[data.control]
 
-        cm = (data.pert == data.control) & (data.split != "test")
-        crows = np.where(cm)[0]
-        cdf = pd.DataFrame({"ctx": data.context[crows], "u": unit[crows]}, index=crows)
-        ctl_of = {k: crows[v] for k, v in
-                  cdf.groupby(["ctx", "u"] if by_unit else ["ctx"], sort=False).indices.items()}
+        def _key(idx):
+            return ((data.cid[idx].astype(np.int64) * n_u + unit_code[idx]) * n_p
+                    + data.aid[idx])
+
+        def _blocks(idx):
+            """idx grouped by composite key -> {key: member rows}, via one sort."""
+            k = _key(idx)
+            o = np.argsort(k, kind="stable")
+            ks, rs = k[o], idx[o]
+            cut = np.flatnonzero(np.r_[True, ks[1:] != ks[:-1]])
+            return {int(ks[b]): rs[b:e] for b, e in
+                    zip(cut, np.r_[cut[1:], len(ks)])}
+
+        target = _blocks(rows)
+        crows = np.where((data.aid == ctl_id) & (data.split != "test"))[0]
+        ctl_of = {}
+        for k, v in _blocks(crows).items():
+            ctl_of[k // n_p] = v              # controls keyed by (context, unit) only
 
         self.groups = []
-        for (ctx, u, prt), pos in target.items():
-            if len(pos) < min_cells or (not include_control and prt == data.control):
+        for k, pos in target.items():
+            ai = k % n_p
+            if len(pos) < min_cells or (not include_control and ai == ctl_id):
                 continue
-            ctl = ctl_of.get((ctx, u) if by_unit else ctx)
+            ctl = ctl_of.get(k // n_p)
             if ctl is None or len(ctl) < min_cells:
                 continue                      # no reference population -> not trainable
-            self.groups.append((rows[pos], ctl, data.c2i[ctx], data.a2i[prt]))
+            self.groups.append((pos, ctl, int(k // n_p // n_u), int(ai)))
         self.rng = np.random.default_rng(seed)
         print(f"[data] {len(self.groups)} trainable conditions in '{split}' "
               f"({self.n_cond} x {self.set_size} cells per batch)", flush=True)

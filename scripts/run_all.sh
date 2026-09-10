@@ -32,22 +32,30 @@ EXTRA="${EXTRA:-}"
 STEPS_ARG=""
 [ -n "${STEPS:-}" ] && STEPS_ARG="train.max_steps=$STEPS train.stage1_steps=$((STEPS/2)) train.stage2_steps=$((STEPS/2))"
 
-PREP="$PE_DATA_ROOT/perturb_bench/$DS.h5ad"
-[ -f "$PREP" ] || python -m perturbenergy.data.prepare --dataset "$DS"
+# DATA_PATH 覆盖默认的 prepped 文件，用于全量 Tahoe 这类 memmap 目录
+PREP="${DATA_PATH:-$PE_DATA_ROOT/perturb_bench/$DS.h5ad}"
+PATHARG=""
+if [ -n "${DATA_PATH:-}" ]; then
+  PATHARG="--path $DATA_PATH"
+  [ -e "$DATA_PATH" ] || { echo "DATA_PATH 不存在: $DATA_PATH"; exit 1; }
+else
+  [ -f "$PREP" ] || python -m perturbenergy.data.prepare --dataset "$DS"
+fi
+TAG="${TAG:-}"
 
 run () {                       # run <name> <config overrides...>
   local name="$1"; shift
   if [ -n "$ONLY" ] && [ "$ONLY" != "$name" ]; then return 0; fi
   echo "########## $DS / $name ##########"
-  python scripts/train.py --dataset "$DS" --run "${DS}_${name}" --evaluate \
+  python scripts/train.py --dataset "$DS" --run "${DS}${TAG}_${name}" $PATHARG --evaluate \
       --set "$@" $STEPS_ARG $EXTRA
 }
 
 echo "########## $DS / reference predictors ##########"
 for p in control mean_shift; do
   if [ -z "$ONLY" ] || [ "$ONLY" = "$p" ]; then
-    python scripts/evaluate.py --dataset "$DS" --predictor "$p" \
-        --out "$PE_MODELS_ROOT/${DS}_ref_${p}/eval.json"
+    python scripts/evaluate.py --dataset "$DS" --predictor "$p" $PATHARG \
+        --out "$PE_MODELS_ROOT/${DS}${TAG}_ref_${p}/eval.json"
   fi
 done
 if [ "$DS" = "norman" ] && { [ -z "$ONLY" ] || [ "$ONLY" = "additive" ]; }; then

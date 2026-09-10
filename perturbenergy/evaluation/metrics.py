@@ -67,6 +67,8 @@ DEG_METRICS = {
     "R2":       (True,  "R^2 of mean expression over the true top-k DE genes"),
     "R2_delta": (True,  "R^2 of the delta over the true top-k DE genes"),
     "PCC":      (True,  "Pearson of mean expression over the true top-k DE genes"),
+    "RMSE_cell": (False, "predicted mean vs EVERY real cell, over the top-k DE genes"),
+    "R2_cell":   (True,  "R^2 of the predicted mean against real cells, top-k DE genes"),
 }
 
 
@@ -218,6 +220,10 @@ def group_metrics(X_pred, X_real, X_ctrl, de_idx=None, top_k=50, pca=None,
         out[f"de{k}_R2"] = float(r2_score(mu_r[idx], mu_p[idx]))
         out[f"de{k}_R2_delta"] = float(r2_score(d_r[idx], d_p[idx]))
         out[f"de{k}_PCC"] = _pearson(mu_p[idx], mu_r[idx])
+        # the cell-level pair as well, restricted to the same genes: the mean profile
+        # against EVERY real cell rather than against the real mean
+        out[f"de{k}_RMSE_cell"], out[f"de{k}_R2_cell"] = _cell_level(X_real[:, idx],
+                                                                    mu_p[idx])
 
     # --- DE-set retrieval at top_k ---------------------------------------- #
     true_de = set((de_idx or {}).get(top_k, np.argsort(-np.abs(d_r))[:top_k]).tolist())

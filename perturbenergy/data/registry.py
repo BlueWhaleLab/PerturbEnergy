@@ -59,6 +59,12 @@ REGISTRY = {
         path=os.path.join(P.TAHOE_DIR, "data"),
         context="cell_line_id",
         pert="drug",
+        dose_col="sample",             # Tahoe screens each drug at ~3 DOSES. The atlas has
+                                       #  380 drugs but 1,344 (drug, sample) pairs, and
+                                       #  PerturbDiff's "#Perturbations 1,137" counts those
+                                       #  -- "1,100 drug treatment AND DOSAGE combinations".
+                                       #  So a perturbation is 'Drug@k', not 'Drug'; the
+                                       #  drug name is kept in obs for aggregate analysis.
         control="DMSO_TF",
         panel=os.path.join(P.GENE_PANELS, "tahoe100m_real_selected_genes.pkl"),
         split_kind="unseen_context",

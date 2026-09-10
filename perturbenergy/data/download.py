@@ -147,11 +147,41 @@ def get_tahoe(args):
     else:
         want = allf[: args.tahoe_shards]
     todo = [f for f in want if os.path.basename(f) not in hv]
-    print(f"[tahoe] {len(todo)} to fetch", flush=True)
-    for i, f in enumerate(todo):
-        _hf_get(TAHOE_REPO, f, P.TAHOE_DIR)
-        if i % 50 == 0:
-            print(f"[tahoe] {i}/{len(todo)}", flush=True)
+    print(f"[tahoe] {len(todo)} to fetch with {args.workers} workers", flush=True)
+    if not todo:
+        return
+    # One shard at a time tops out around 5 MB/s here, which is 9 hours for the full
+    # atlas; the bottleneck is per-connection, not the link, so fetch in parallel.
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from huggingface_hub import hf_hub_download
+    done, t0, lock = [0], time.time(), __import__("threading").Lock()
+
+    def one(f):
+        out = os.path.join(P.TAHOE_DIR, f)
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+        for attempt in range(4):
+            try:
+                return hf_hub_download(repo_id=TAHOE_REPO, filename=f, repo_type="dataset",
+                                       local_dir=P.TAHOE_DIR, cache_dir=P.HF_CACHE)
+            except Exception as e:                                        # noqa: BLE001
+                if attempt == 3:
+                    print(f"  [fail] {f}: {e}", flush=True)
+                    return None
+                time.sleep(2 ** attempt)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {ex.submit(one, f): f for f in todo}
+        for fut in as_completed(futs):
+            fut.result()
+            with lock:
+                done[0] += 1
+                if done[0] % 25 == 0 or done[0] == len(todo):
+                    el = time.time() - t0
+                    rate = done[0] / max(el, 1e-9)
+                    print(f"[tahoe] {done[0]}/{len(todo)}  {rate*60:.1f} shards/min  "
+                          f"eta {(len(todo)-done[0])/max(rate,1e-9)/60:.0f}m", flush=True)
 
 
 GETTERS = {"panels": get_panels, "replogle": get_replogle, "pbmc": get_pbmc,
@@ -167,6 +197,8 @@ def main():
                     help="keep the .zst archive after decompressing (needs 2x the space)")
     ap.add_argument("--tahoe_shards", type=int, default=0,
                     help="total number of Tahoe parquet shards to have locally")
+    ap.add_argument("--workers", type=int, default=16,
+                    help="parallel shard downloads (Tahoe)")
     ap.add_argument("--tahoe_stride", type=int, default=0,
                     help="take every N-th shard of the 3,388 instead of the first ones. "
                          "Tahoe is ordered BY DRUG, so a contiguous prefix covers very few "

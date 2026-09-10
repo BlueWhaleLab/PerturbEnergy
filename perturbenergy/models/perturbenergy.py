@@ -13,13 +13,24 @@ Two embedding tables -- context and perturbation, both `d` wide -- are owned her
 shared by the encoders and the energy, so `a` reaches the posterior and the prior through
 the same parameters.
 
-Forward (training) reconstructs the OBSERVED cell: that is what the ELBO of Eq. 7 is a
-bound on, and the observed cell already carries its own perturbation label.
+`forward` itself is direction-agnostic -- it maps the cell it is handed, under (c, a), to
+a reconstruction. WHICH cell that is, and what the target is, belongs to the training
+loop (training.trainer, `train.pairing`):
 
-Inference (`predict`, the paper's Inference paragraph) is the counterfactual direction:
-an UNPERTURBED cell (x0, c0) and a target perturbation a ->
+  control   (default) x is an UNPERTURBED cell of the group's context and the target is
+            the PERTURBED population of (context, perturbation). That is the task itself.
+            Cells are unpaired -- the assay is destructive -- so the loss compares
+            POPULATIONS (condition means + MMD), never cell to cell.
+  observed  x is the observed cell and the target is itself: the literal Eq. 7 ELBO.
+            Kept as an ablation; it makes a better autoencoder and a far worse predictor,
+            because z_b already carries the whole cell and the generator can ignore z_a.
+
+Inference (`predict`, the paper's Inference paragraph) is always the counterfactual
+direction: an UNPERTURBED cell (x0, c0) and a target perturbation a ->
     z_b0 ~ q(z_b|x0,c0);  M candidates z_a ~ q(z_a|z_b0, a);
     keep the candidate with the LOWEST energy;  x = p_theta(x|z_b0, z_a*).
+Training draws `model.n_candidates` (1 by default), inference draws `eval.m_samples` (16),
+so the energy shapes z_a through the loss during training and also SELECTS it at test time.
 """
 import torch
 import torch.nn as nn

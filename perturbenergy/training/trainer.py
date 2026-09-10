@@ -85,6 +85,12 @@ class Trainer:
         self.L, self.O, self.LG, self.T = cfg.loss, cfg.optim, cfg.langevin, cfg.train
         os.makedirs(out_dir, exist_ok=True)
 
+        if str(data.device) != str(device):
+            raise ValueError(
+                f"data yields batches on {data.device!r} but the model is on {device!r}. "
+                f"PerturbData's `device` is the batch destination, not where the matrix "
+                f"is stored -- pass the compute device and control residency with "
+                f"data.gpu_resident / data.gpu_budget_gb.")
         self.pairing = cfg.train.get("pairing", "control")
         self.set_size = int(cfg.data.get("set_size", 32))
         if self.pairing == "control":
