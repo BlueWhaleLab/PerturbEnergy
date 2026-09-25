@@ -1,0 +1,27 @@
+# pip-only install for PerturbEnergy and PerturbEnergyBaselines (python 3.11).
+#
+#     python3.11 -m venv .venv && . .venv/bin/activate
+#     pip install -r requirements.txt
+#
+# torch is pinned to a CUDA 12.8 build: the development GPUs are Blackwell (sm_120) and a
+# cu121-or-older wheel imports fine, then fails at the first kernel launch. On sm_80/86/90
+# change the index URL to match your driver. See environment.yml for the conda route.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0        # resolves to 2.11.0+cu128 from the index above; do not
+                     # pin the +cu128 suffix or no other index can satisfy it
+
+numpy==2.4.6
+scipy==1.17.1
+pandas==2.3.3
+scikit-learn==1.9.0
+
+anndata==0.12.19
+h5py==3.16.0
+scanpy==1.11.5
+pyarrow==25.0.1
+
+huggingface-hub==1.30.0
+
+pyyaml==6.0.3
+matplotlib==3.11.1
+umap-learn==0.5.12

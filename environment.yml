@@ -1,0 +1,49 @@
+# Conda environment for PerturbEnergy and PerturbEnergyBaselines.
+#
+#     conda env create -f environment.yml -p /path/to/envs/perturbenergy
+#     conda activate /path/to/envs/perturbenergy
+#
+# The two projects MUST share one interpreter: the baselines import PerturbEnergy's data
+# loader, split logic and metric code, and a baseline scored under a different
+# numpy/scipy would not be comparable with the method.
+#
+# THE ONE HARD CONSTRAINT IS THE CUDA BUILD. The GPUs this was developed on are Blackwell
+# (sm_120); a torch wheel built against cu121 or older will import fine and then fail at
+# the first kernel launch. cu128 is the floor. On older cards (sm_80/86/90) any recent
+# torch works -- swap the index URL below for the one matching your driver.
+#
+# Everything is installed through pip rather than conda-forge so that torch comes from
+# the PyTorch index with the CUDA build pinned; mixing a conda-forge torch with
+# conda-forge numpy is where this environment historically broke.
+name: perturbenergy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # --- torch, from the CUDA 12.8 index (see the note above) ---
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.11.0             # resolves to 2.11.0+cu128 from that index --
+                                  # do NOT pin the +cu128 suffix, it makes the
+                                  # line uninstallable from any other index
+
+      # --- numerics: every metric and the whole training loop ---
+      - numpy==2.4.6
+      - scipy==1.17.1              # mannwhitneyu (DE ranking), Sinkhorn, Wilcoxon
+      - pandas==2.3.3
+      - scikit-learn==1.9.0        # PCA for the cell-line selection and PCA metrics
+
+      # --- single-cell I/O ---
+      - anndata==0.12.19
+      - h5py==3.16.0               # the .h5ad backing store and the memmap sidecars
+      - scanpy==1.11.5             # only perturbenergy/data/h5utils.py (HVG selection)
+      - pyarrow==25.0.1            # only the Tahoe parquet shards
+
+      # --- fetching the public datasets ---
+      - huggingface-hub==1.30.0
+
+      # --- config and figures ---
+      - pyyaml==6.0.3
+      - matplotlib==3.11.1
+      - umap-learn==0.5.12         # only visualization/embed_umap.py

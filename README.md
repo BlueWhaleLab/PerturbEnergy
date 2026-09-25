@@ -16,6 +16,77 @@ Langevin chain (Eq. 15).
 
 ---
 
+## 0. Install
+
+```bash
+conda env create -f environment.yml -p /path/to/envs/perturbenergy
+conda activate /path/to/envs/perturbenergy
+```
+
+or, without conda, `python3.11 -m venv .venv && . .venv/bin/activate &&
+pip install -r requirements.txt`. Both files pin the versions this was developed and
+scored with; [`environment.yml`](environment.yml) carries the reasoning for each.
+
+**The CUDA build is the one hard constraint.** These GPUs are Blackwell (sm_120) and a
+torch wheel built against cu121 or older will import without complaint and then fail at
+the first kernel launch. cu128 is the floor:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.get_arch_list()[-1])"
+# 2.11.0+cu128 sm_120
+```
+
+On sm_80/86/90 cards any recent torch works — change the `--extra-index-url` in either
+file to the build matching your driver.
+
+### The two repositories share one interpreter
+
+`PerturbEnergyBaselines` imports this project's data loader, split logic and metric code
+rather than re-implementing them, so both must run under the **same** environment: a
+baseline scored under a different numpy/scipy is not comparable with the method. Its
+`env.sh` puts this checkout on `PYTHONPATH` and expects it as a sibling directory:
+
+```
+codes/
+  PerturbEnergy/            <- this repo
+  PerturbEnergyBaselines/   <- the ten baselines
+```
+
+### Paths and shell setup
+
+[`env.sh`](env.sh) activates the environment and exports the roots every script reads.
+Source it once per shell; override any variable beforehand to point elsewhere.
+
+| variable | default | what lives there |
+|---|---|---|
+| `PE_DATA_ROOT` | `/data/projects/yyc/datasets` | raw downloads and prepped `.h5ad` / memmap |
+| `PE_MODELS_ROOT` | `/data/projects/yyc/models/perturbenergy` | runs: checkpoints, `metrics.csv`, `eval.json` |
+| `PB_MODELS_ROOT` | `/data/projects/yyc/models/baselines` | the baselines' runs (set in their `env.sh`) |
+| `PE_WORK_ROOT` | `/data/projects/yyc` | parent of `TMPDIR` and the HF cache |
+
+It also sets `HDF5_USE_FILE_LOCKING=FALSE` (h5py/AnnData on this filesystem) and
+`OMP_NUM_THREADS=8` (several jobs share the box — leaving it unset lets one numpy
+gather spin up 128 threads and starve the others). Defaults also live in
+[`perturbenergy/paths.py`](perturbenergy/paths.py), so the package works without
+sourcing anything as long as the environment is active.
+
+### Optional pieces
+
+* `scanpy` is used in exactly one place (HVG selection in
+  [`perturbenergy/data/h5utils.py`](perturbenergy/data/h5utils.py)) and `pyarrow` in one
+  more (reading the Tahoe parquet shards). Both are in the pin list because data
+  preparation needs them; inference and training do not.
+* `umap-learn` is only for [`visualization/embed_umap.py`](visualization/embed_umap.py).
+* **scGPT is deliberately NOT a dependency.** The `scgpt` package pins `torch<2.1` and
+  builds against `flash-attn`, neither of which works here, so the baselines re-declare
+  the encoder architecture and load the published weights by name — see
+  `perturbbaselines/foundation/scgpt.py`. Fetch the weights with
+  `python scripts/fetch_foundation.py --model scgpt` in that repo.
+* No scheduler on this box: the run scripts are plain bash, launched by hand with
+  `nohup`.
+
+---
+
 ## 1. What the model is
 
 Input: an **unperturbed** cell's expression, its context, and a target perturbation.
@@ -244,6 +315,20 @@ perturbenergy/
 scripts/  train.py evaluate.py report.py report_html.py probe_memmap.py
           run_all.sh reeval.sh run_tahoe_full.sh tahoe_full_pipeline.sh
 configs/  default.yaml + one per dataset
+
+env.sh            activates the conda env and exports the path roots (section 0)
+environment.yml   the conda environment, versions pinned
+requirements.txt  the same pins for a pip/venv install
+
+--- studies, each self-contained: code, data and a README of its own ---
+ablation_and_hyperparameter_study/   ablation + K/eta heat map + M sweep + step cost
+results_demo_hvg_radar/              the 12-metric radar over 12 methods
+results_demo_perturbation_study/     perturbation-specific-information bars
+results_demo_hyperparameter_study/   the earlier heat-map version of the sweep
+latent_analysis/                     linear/MLP probes on frozen representations
+visualization/                       UMAP of the decoder-input representations
+model_agnostic_study/                the energy prior on scGen / PerturbedVAE backbones
+training_model_scale_study/          training budget x model scale
 ```
 
 ## 7. Implementation choices worth knowing
