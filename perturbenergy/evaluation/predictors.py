@@ -24,7 +24,13 @@ import numpy as np
 class Predictor:
     name = "base"
 
-    def fit(self, X_train, obs_train, control, data=None):
+    def fit(self, data, train_mask):
+        """`data` is the PerturbData, `train_mask` a boolean over its rows.
+
+        Deliberately NOT handed a materialised training matrix: on a memmapped dataset
+        that would pull the whole split into RAM (715 GB for full Tahoe). A predictor
+        that needs expression reads it in chunks; most need none at all.
+        """
         return self
 
     def predict(self, X_ctrl, context, pert):
@@ -43,25 +49,51 @@ class ControlPredictor(Predictor):
 
 class MeanShiftPredictor(Predictor):
     name = "mean_shift"
+    chunk = 250_000
 
-    def fit(self, X_train, obs_train, control, data=None):
-        prt = obs_train["pert"].astype(str).values
-        ctx = obs_train["context"].astype(str).values
-        ctl_mu = {c: X_train[(ctx == c) & (prt == control)].mean(0)
-                  for c in np.unique(ctx) if ((ctx == c) & (prt == control)).any()}
-        glob = (X_train[prt == control].mean(0) if (prt == control).any()
-                else X_train.mean(0))
+    def fit(self, data, train_mask):
+        """Per-perturbation mean deltas, accumulated over the training rows in chunks.
+
+        This is the one predictor that has to touch the expression matrix, so it walks it
+        in sorted row order -- sequential over a memmap -- summing per perturbation and
+        per (context, control) instead of slicing the split out into memory.
+        """
+        control = data.control
+        rows = np.where(train_mask)[0]
+        prt, ctx = data.pert[rows], data.context[rows]
+        G = data.n_genes
+
+        p_sum, p_n, c_sum, c_n = {}, {}, {}, {}
+        for s in range(0, len(rows), self.chunk):
+            r = rows[s:s + self.chunk]
+            blk = np.asarray(data.X_np[r], dtype=np.float32)
+            bp, bc = prt[s:s + self.chunk], ctx[s:s + self.chunk]
+            is_c = bp == control
+            for p in np.unique(bp):
+                m = bp == p
+                p_sum[p] = p_sum.get(p, 0.0) + blk[m].sum(0, dtype=np.float64)
+                p_n[p] = p_n.get(p, 0) + int(m.sum())
+            for c in np.unique(bc[is_c]):
+                m = is_c & (bc == c)
+                c_sum[c] = c_sum.get(c, 0.0) + blk[m].sum(0, dtype=np.float64)
+                c_n[c] = c_n.get(c, 0) + int(m.sum())
+
+        ctl_mu = {c: c_sum[c] / c_n[c] for c in c_sum}
+        glob = (sum(c_sum.values()) / max(sum(c_n.values()), 1) if c_sum
+                else np.zeros(G, np.float32))
+        # which contexts each perturbation was measured in -- the delta is taken against
+        # THOSE controls, otherwise it absorbs the context difference
+        seen_ctx = {}
+        for p, c in zip(prt, ctx):
+            seen_ctx.setdefault(p, set()).add(c)
         self.delta = {}
-        for p in np.unique(prt):
+        for p in p_sum:
             if p == control:
                 continue
-            m = prt == p
-            # compare against the control of the SAME contexts this perturbation was
-            # measured in, otherwise the delta absorbs the context difference
-            base = np.mean([ctl_mu.get(c, glob) for c in np.unique(ctx[m])], axis=0)
-            self.delta[p] = X_train[m].mean(0) - base
+            base = np.mean([ctl_mu.get(c, glob) for c in sorted(seen_ctx[p])], axis=0)
+            self.delta[p] = p_sum[p] / p_n[p] - base
         self.fallback = (np.mean(list(self.delta.values()), axis=0) if self.delta
-                         else np.zeros(X_train.shape[1], np.float32))
+                         else np.zeros(G, np.float32))
         return self
 
     def predict(self, X_ctrl, context, pert):
@@ -105,7 +137,7 @@ class PerturbEnergyPredictor(Predictor):
             self.c2i, self.a2i = d["context"], d["pert"]
             self.predictable = dict(zip(d["pert"], d.get("predictable", [])))
 
-    def fit(self, X_train, obs_train, control, data=None):
+    def fit(self, data, train_mask):
         if self.c2i is None and data is not None:
             self.c2i, self.a2i = data.c2i, data.a2i
             self.predictable = dict(zip(data.labels, data.pert_predictable.tolist()))

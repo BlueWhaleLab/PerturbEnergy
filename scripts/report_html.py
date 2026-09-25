@@ -53,16 +53,23 @@ DATASET_NOTES = {
     "pbmc": ("PBMC · 细胞因子", "1,674,722 cells · 原始的 17.3%",
              "留出 4/12 供体，30% 扰动回流。测试条件 63 个（论文 62）— 条件全覆盖，"
              "但每组细胞 cap 100，训练数据量为论文的 1/5.8。", True),
-    "tahoe": ("Tahoe-100M · 药物", "1,922,974 cells · 原始的 1.9%",
+    "tahoe_full": ("Tahoe-100M 全量", "95,624,334 cells · 全量 (765 GB, memmap)",
+                   "PCA 选 5/50 细胞系留出 (CVCL_1097/1119/1571/1715/1717)，30% 回流。"
+                   "扰动单位是<b>药物×剂量</b>共 <b>1,317</b> 个，与论文的 1,137 同口径。"
+                   "60,979 个可训练条件，95k 步（每条件约 25 次抽样）。评估 300 组，"
+                   "<b>n_real = n_ctrl = 300</b>（Cell-Eval 的 N_ctrl=N_pert 约定，"
+                   "本栏独有，其余各栏真实细胞数不设上限）。"
+                   "<b>与下方「药物级(旧)」栏不可比</b> — 变的不只是规模，还有扰动的定义；"
+                   "剂量分开后目标更干净，R²_delta 由 0.256 升至 0.482（无能量），"
+                   "PDS 也由 0.046 改善到 0.021。", False),
+    "tahoe": ("Tahoe-100M · 药物级 (旧)", "1,922,974 cells · 原始的 1.9%",
               "PCA 选 5/50 细胞系留出，30% 回流。<b>本栏的扰动单位是「药物」(380 个)，"
-              "而非论文的「药物×剂量」(1,137 个)</b>：Tahoe 有 379 种药 + DMSO，但 1,344 个 "
+              "而非论文的「药物×剂量」</b>：Tahoe 有 379 种药 + DMSO，但 1,344 个 "
               "(drug, sample) 组合，每种药约 3 个剂量。把剂量混为一个条件并非无害 — 实测同药"
               "不同剂量之间 delta 的余弦相似度中位仅 <b>0.389</b>（38% 的组低于 0.3），最强/最弱"
               "剂量的模长比中位 1.6×，即不同剂量触发的是部分不同的转录程序。因此本栏的真实 delta "
-              "不对应任何真实实验条件，DE 基因集合被稀释，delta 类指标被<b>低估</b>；同时判别池只有 "
-              "380 而非 1,317，PDS 类指标被<b>高估</b>。能量 vs 无能量的相对排序仍可信（同一定义下"
-              "比较），但绝对值不宜引用。全量正确版本（95.6M cells，约 1,317 个扰动）正在准备。",
-              True),
+              "不对应任何真实实验条件，DE 基因集合被稀释。"
+              "<b>保留本栏仅供对照，绝对值不宜引用</b>，请以上方「全量」栏为准。", True),
 }
 
 
@@ -116,7 +123,8 @@ def table(rows, cols, dirs, caption):
 
 
 def build(by_ds):
-    order = [d for d in ("norman", "replogle", "pbmc", "tahoe") if d in by_ds]
+    order = [d for d in ("norman", "replogle", "pbmc", "tahoe_full", "tahoe")
+             if d in by_ds]
     tabs, panes = [], []
     for i, ds in enumerate(order):
         runs = by_ds[ds]
@@ -128,7 +136,7 @@ def build(by_ds):
         title, scale, note, warn = DATASET_NOTES.get(ds, (ds, "", "", False))
         tabs.append(f'<button class="tab{" on" if i == 0 else ""}" data-ds="{ds}" '
                     f'role="tab" aria-selected="{"true" if i == 0 else "false"}">'
-                    f'{title.split(" · ")[0]}</button>')
+                    f'{title.split(" · ")[0] if ds != "tahoe" else "Tahoe (旧)"}</button>')
 
         blocks = "".join(
             table(rows, cols, {c: HVG_METRICS[c][1] for c in cols},

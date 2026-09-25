@@ -282,6 +282,11 @@ class Trainer:
     def run(self):
         T = self.T
         mode = T.mode
+        # `train.snapshot_steps`: extra checkpoints AT those exact steps, for a
+        # training-budget study. They are the weights at that step, not the best-so-far,
+        # so a curve over them answers "what would N steps have bought me". Empty by
+        # default, so an ordinary run is unchanged.
+        snaps = {int(x) for x in (T.get("snapshot_steps", []) or [])}
         if mode == "finetune":
             plan = [("vae", T.stage1_steps, False), ("energy", T.stage2_steps, True)]
         else:
@@ -320,6 +325,9 @@ class Trainer:
                                      avg.get("e_term", ""), "", round(time.time() - t0)])
                     self.f.flush()
                     acc, nacc = {}, 0
+                if step in snaps:
+                    self.save(step, f"step{step}")
+                    print(f"          snapshot -> model_step{step}.pt", flush=True)
                 if step % T.eval_every == 0 or step == (sum(p[1] for p in plan)):
                     v = self.validate()
                     lbl = ("val condition-mean MSE/gene" if self.pairing == "control"

@@ -6,6 +6,10 @@ only way the numbers compare.
                   the control perturbation excluded; the largest `max_groups` are scored.
                   Perturbations that cannot be embedded from targets seen in training are
                   dropped for EVERY predictor, so all columns are scored on one set.
+    n_real        cap on the real population per group (0 = all). Cell-Eval matches it
+                  to the control count; on full Tahoe leaving it uncapped means ~2,700
+                  cells a group against the capped build's <=100, and the O(n^2)
+                  distribution metrics then dominate everything.
     input         the control population of the SAME context -- and, where the split is
                   taken on another column (PBMC holds out DONORS while the model conditions
                   on CELL TYPE), of the same held-out donors. That is what a virtual cell
@@ -35,14 +39,21 @@ from .predictors import build_predictor
 
 def evaluate(data, predictor, *, split="test", min_cells=30, max_groups=200, n_ctrl=300,
              de_ks=(50, 100, 200), de_method="wilcoxon", top_k=50, distribution=True,
-             seed=0, verbose=True, require_predictable=True):
+             seed=0, verbose=True, require_predictable=True, n_real=0):
     """-> (summary dict, per-group rows)."""
+    # NOTE: never index the expression matrix with a whole-split boolean mask. On a
+    # memmapped dataset that materialises the selection: full Tahoe's 89.4M training rows
+    # are 715 GB, which took the machine to its knees. `fit` gets the dataset and a mask
+    # and reads what it needs; the PCA/scale references only ever needed a few thousand
+    # control cells, so they take a slice of rows rather than every control cell (2.2M
+    # rows = 18 GB here).
     X, obs = data.X_np, data.obs
     is_tr = data.split == "train"
-    predictor.fit(X[is_tr], obs[is_tr], data.control, data)
+    predictor.fit(data, is_tr)
 
-    ctl_all = X[data.pert == data.control]
-    pca = fit_pca(ctl_all[:4000], 50, seed)
+    ctl_rows = np.where(data.pert == data.control)[0]
+    ctl_all = np.asarray(X[ctl_rows[:4000]], dtype=np.float32)
+    pca = fit_pca(ctl_all, 50, seed)
     dist_scale = reference_scale(ctl_all[:512], seed=seed)
     pca_scale = reference_scale(pca.transform(ctl_all[:512]), seed=seed)
 
@@ -53,7 +64,7 @@ def evaluate(data, predictor, *, split="test", min_cells=30, max_groups=200, n_c
 
     rows, dp, dr, skipped = [], [], [], []
     t0 = time.time()
-    for gi, (ctx, prt, n_real) in enumerate(groups):
+    for gi, (ctx, prt, n_avail) in enumerate(groups):
         # Whether a perturbation is embeddable at all is a property of the SPLIT, not of
         # the predictor: its targets simply never occur in training. Drop those groups for
         # everyone, otherwise `control` and `mean_shift` -- which need no embedding -- get
@@ -71,13 +82,13 @@ def evaluate(data, predictor, *, split="test", min_cells=30, max_groups=200, n_c
         if len(ctl) < 5:
             skipped.append(f"{ctx}|{prt} (no control cells)")
             continue
-        X_real = data.cells_of(ctx, prt, split)
+        X_real = data.cells_of(ctx, prt, split, max_cells=n_real or None, seed=seed)
         X_pred = predictor.predict(ctl, ctx, prt)
         de_idx, _, _ = de_sets(X_real, ctl, de_ks, de_method)
         r = group_metrics(X_pred, X_real, ctl, de_idx, top_k, pca, distribution,
                           seed=seed, dist_scale=dist_scale, pca_scale=pca_scale)
-        r.update(group=f"{ctx}|{prt}", context=ctx, pert=prt, n_real=int(n_real),
-                 n_ctrl=int(len(ctl)))
+        r.update(group=f"{ctx}|{prt}", context=ctx, pert=prt,
+                 n_avail=int(n_avail), n_real=int(len(X_real)), n_ctrl=int(len(ctl)))
         rows.append(r)
         dp.append(X_pred.mean(0) - ctl.mean(0))
         dr.append(X_real.mean(0) - ctl.mean(0))
@@ -91,6 +102,7 @@ def evaluate(data, predictor, *, split="test", min_cells=30, max_groups=200, n_c
     summary = summarise([{k: v for k, v in r.items() if k not in drop} for r in rows], disc)
     summary.update(dataset=data.dataset, predictor=predictor.name, split=split,
                    split_kind=data.split_kind, de_method=de_method, top_k=top_k,
+                   n_ctrl=int(n_ctrl), n_real=int(n_real),
                    n_skipped=len(skipped), seconds=round(time.time() - t0))
     if skipped and verbose:
         print(f"[eval] skipped {len(skipped)} groups the predictor cannot handle: "

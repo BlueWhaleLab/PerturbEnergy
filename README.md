@@ -107,7 +107,7 @@ Splits follow **PerturbDiff App. A.2.3** (which follows STATE):
 | dataset | cells / perturbations / contexts | split |
 |---|---|---|
 | **Replogle** (Nadig CRISPRi) | 643,413 / 2,023 + control / 4 cell lines | hold out **hepg2**, leak 30% of its perturbations back into train |
-| **Tahoe-100M** (drug) | 1.92M cells prepped from 1,409 parquet shards / 380 drugs / 50 cell lines | hold out **5 cell lines chosen by PCA on the pseudobulk profiles**, leak 30% |
+| **Tahoe-100M** (drug) | 95.6M cells / **1,317 drug-at-a-dose** perturbations / 50 cell lines | hold out **5 cell lines chosen by PCA on the pseudobulk profiles**, leak 30% |
 | **PBMC** (Parse cytokines) | 9.7M / 90 cytokines / 18 cell types × 12 donors | hold out **4 of 12 donors**, leak 30% (the model still conditions on cell type) |
 | **Norman2019** (CRISPRa) | 106 single targets + 131 pairs, one cell line | see below |
 
@@ -121,13 +121,30 @@ of its targets, a held-out pair is still representable. A per-label lookup table
 predict them at all; there would be no row. For the three single-target datasets the same
 code is exactly the plain `nn.Embedding` table.
 
-**Tahoe coverage.** Tahoe is ordered by drug, so a contiguous prefix of shards covers very
-few of them: the 419 shards originally on disk held 11.8M cells but only 95 of the 1,137
-drugs. `--tahoe_stride 3` spreads the download over the whole atlas and buys coverage
-instead of depth — 1,409 shards, 39.8M cells, **380 drugs**, 19,000 (drug, cell line)
-conditions, from which the prep keeps 100 cells per condition (1.92M cells). Dropping the
-stride to 1 downloads the remaining ~310 GB and recovers all 1,137 drugs; nothing else
-changes.
+**A Tahoe perturbation is a drug AT A DOSE, not a drug.** The atlas screens **379 drugs**
+(plus DMSO) at ~3 doses each, giving **1,344 (drug, sample) pairs**; PerturbDiff's
+"#Perturbations 1,137" counts those — its wording is "1,100 small-molecule drug treatment
+**and dosage combinations**". Pooling the doses into one condition is not harmless:
+measured over 190 (cell line, drug) groups, the cosine between one dose's delta and
+another's is **0.389 at the median** (38% of groups below 0.3), with the strongest dose's
+delta 1.6x the weakest in norm. Different doses drive partly different transcriptional
+programs, so pooling gives a target that matches no real experiment, dilutes the DE gene
+set, and asks the model to fit three different answers from one `(c, a)` input. Labels are
+therefore `Drug@k` (control stays `DMSO_TF`), and the drug name is kept in `obs["drug"]`.
+
+**Tahoe shard layout.** Shards are ordered by sample, so a contiguous prefix covers very
+few drugs — the first 419 held 11.8M cells but only 95. `--tahoe_stride N` spreads the
+download over the whole atlas; `--tahoe_stride 1` (3,388 shards, ~310 GB) is the full one.
+
+**Full Tahoe needs the memmap backend.** 95.6M cells x 2,000 genes of float32 is **765 GB**,
+which no machine here keeps resident, so `--backend memmap` streams the matrix straight to
+disk (`X.f32` + `obs.parquet` + `meta.json`) and `PerturbData` opens it with `np.memmap`.
+A training step touches 1,024 rows (8 MB) and measured ~40 ms cold vs ~37 ms warm on this
+box — the page cache holds the working set, so residency is not the bottleneck. Three
+places had to stop materialising label strings for this to be viable (prep's obs, the
+loader's vocabularies, the sampler's grouping); each is fine at 2M rows and fatal at 96M.
+`scripts/probe_memmap.py` reports the shape, the measured step time, and the step budget
+for a target number of passes over the conditions.
 
 Control cells stay in `train` under every protocol: they are the unperturbed reference
 that inference is fed, and PerturbDiff likewise counts them separately from its
@@ -171,14 +188,20 @@ source env.sh                                    # conda env `squidiff`, paths, 
 # --- data (only Tahoe was already on disk) ---
 python -m perturbenergy.data.download --what panels norman replogle
 python -m perturbenergy.data.download --what pbmc                 # 53 GB -> ~800 GB
-python -m perturbenergy.data.download --what tahoe --tahoe_stride 3
+python -m perturbenergy.data.download --what tahoe --tahoe_stride 1 --workers 24
 python -m perturbenergy.data.prepare  --dataset replogle
 python -m perturbenergy.data.prepare  --dataset norman
-python -m perturbenergy.data.prepare  --dataset tahoe --max_cells 1500000
+python -m perturbenergy.data.prepare  --dataset tahoe --max_cells 1500000   # capped
+python -m perturbenergy.data.prepare  --dataset tahoe --backend memmap --tag full \
+       --cap_per_group 0 --cap_control 0                                    # full, 765 GB
 python -m perturbenergy.data.prepare  --dataset pbmc  --max_cells 1500000
 
 # --- one dataset, everything: baselines + 4 variants + report ---
 CUDA_VISIBLE_DEVICES=0 bash scripts/run_all.sh replogle
+
+# --- full Tahoe: probe first, then use the step budget it reports ---
+python scripts/probe_memmap.py --path $PE_PREPPED/tahoe_full
+ONLY="noenergy energy_lang energy_mis" STEPS=95000 bash scripts/run_tahoe_full.sh
 
 # --- or piecemeal ---
 python scripts/train.py    --dataset replogle --run rep_energy --evaluate
@@ -204,9 +227,9 @@ perturbenergy/
     registry.py        dataset specs: columns, control label, panel, split protocol
     download.py        HuggingFace / Zenodo fetchers
     h5utils.py         dense / CSR / CSC readers that never load a whole file
-    prepare.py         raw -> the uniform prepped .h5ad
+    prepare.py         raw -> the uniform prepped .h5ad, or a memmap directory
     splits.py          unseen_context / unseen_combo / unseen_pert / random
-    loader.py          in-memory, GPU-resident batching + vocabularies
+    loader.py          resident or memmapped batching + vocabularies
   models/
     layers.py encoders.py decoder.py energy.py pert_embedding.py perturbenergy.py
   training/
@@ -218,7 +241,8 @@ perturbenergy/
     metrics.py         the HVG group and the DEG group
     predictors.py      control / mean_shift / additive / perturbenergy
     runner.py          the protocol
-scripts/  download-free entry points: train.py evaluate.py report.py run_all.sh
+scripts/  train.py evaluate.py report.py report_html.py probe_memmap.py
+          run_all.sh reeval.sh run_tahoe_full.sh tahoe_full_pipeline.sh
 configs/  default.yaml + one per dataset
 ```
 

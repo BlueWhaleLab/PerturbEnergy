@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--min_cells", type=int, default=None)
     ap.add_argument("--max_groups", type=int, default=None)
     ap.add_argument("--n_ctrl", type=int, default=None)
+    ap.add_argument("--n_real", type=int, default=None,
+                    help="cap the real population per group (0/omitted = all)")
     ap.add_argument("--m_samples", type=int, default=None)
     ap.add_argument("--de_ks", type=int, nargs="*", default=None)
     ap.add_argument("--de_method", default=None, choices=["wilcoxon", "delta"])
@@ -55,7 +57,9 @@ def main():
         data, pred, split=args.split or e.split,
         min_cells=args.min_cells if args.min_cells is not None else e.min_cells,
         max_groups=args.max_groups if args.max_groups is not None else e.max_groups,
-        n_ctrl=args.n_ctrl or e.n_ctrl, de_ks=de_ks,
+        n_ctrl=args.n_ctrl or e.n_ctrl,
+        n_real=(args.n_real if args.n_real is not None else e.get("n_real", 0)),
+        de_ks=de_ks,
         de_method=args.de_method or e.de_method, top_k=e.top_k,
         distribution=(not args.no_distribution) and e.distribution, seed=e.seed)
     out = args.out or os.path.join(

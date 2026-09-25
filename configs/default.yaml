@@ -103,6 +103,9 @@ train:
   stage2_steps: 15000         # finetune mode: + energy
   log_every: 500
   eval_every: 2500
+  snapshot_steps: []          # extra checkpoints model_step<N>.pt at these exact steps
+                              # (weights AT step N, not best-so-far) -- for a
+                              # training-budget study. Empty = ordinary run.
   seed: 0
   out_dir: null               # null -> $PE_MODELS_ROOT/<run name>
 

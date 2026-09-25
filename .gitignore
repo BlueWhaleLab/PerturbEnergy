@@ -12,3 +12,6 @@ logs/
 .vscode/
 .idea/
 .DS_Store
+*_study/
+visualization/
+cuda/

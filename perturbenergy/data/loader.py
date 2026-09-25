@@ -262,11 +262,22 @@ class PerturbData:
                for i in order if n[i] >= min_cells]
         return out[:max_groups] if max_groups else out
 
-    def cells_of(self, context, pert, split=None):
+    def cells_of(self, context, pert, split=None, max_cells=None, seed=0):
+        """The real cells of one (context, perturbation) group.
+
+        `max_cells` caps the population. It matters on full Tahoe, where a test group
+        holds ~2,700 cells against the capped build's <=100: the distribution metrics are
+        O(n^2), so leaving it uncapped is ~700x the work, and Cell-Eval's convention is
+        N_ctrl = N_pert anyway.
+        """
         m = (self.context == context) & (self.pert == pert)
         if split:
             m &= self.split == split
-        return self.X_np[m]
+        rows = np.where(m)[0]
+        if max_cells and len(rows) > max_cells:
+            rows = np.sort(np.random.default_rng(seed).choice(rows, max_cells,
+                                                              replace=False))
+        return self.X_np[rows]
 
     def save_vocab(self, path):
         json.dump({"context": self.c2i, "pert": self.a2i, "target": self.t2i,

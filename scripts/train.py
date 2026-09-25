@@ -21,6 +21,12 @@ import torch
 from perturbenergy import config as C
 from perturbenergy import paths as P
 from perturbenergy.data.loader import PerturbData
+# Imported up front, not inside `if args.evaluate`. A deferred import binds whatever is on
+# disk HOURS later, when training ends -- if the code changed meanwhile, the run dies at
+# the finish line against a half-updated module set. Importing here pins one version for
+# the life of the process.
+from perturbenergy.evaluation.predictors import build_predictor
+from perturbenergy.evaluation.runner import evaluate, write_results
 from perturbenergy.training.trainer import Trainer, build_model
 
 
@@ -66,8 +72,6 @@ def main():
     Trainer(model, data, cfg, out_dir, dev).run()
 
     if args.evaluate:
-        from perturbenergy.evaluation.runner import evaluate, write_results
-        from perturbenergy.evaluation.predictors import build_predictor
         ck = os.path.join(out_dir, "model_best.pt")
         pred = build_predictor("perturbenergy", ck, cfg.eval.m_samples, data.combo_sep, dev)
         e = cfg.eval
@@ -75,7 +79,8 @@ def main():
                                  split=e.split, min_cells=e.min_cells,
                                  max_groups=e.max_groups, n_ctrl=e.n_ctrl,
                                  de_ks=tuple(e.de_ks), de_method=e.de_method,
-                                 top_k=e.top_k, distribution=e.distribution, seed=e.seed)
+                                 top_k=e.top_k, distribution=e.distribution, seed=e.seed,
+                                 n_real=e.get("n_real", 0))
         write_results(summary, rows, os.path.join(out_dir, "eval.json"), tuple(e.de_ks))
 
 
