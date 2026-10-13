@@ -1,8 +1,6 @@
 # PerturbEnergy
 
-Implementation of *Energy-based Model for Enhancing Perturbation Signal in Cell Response
-Prediction*: a VAE for single-cell perturbation response prediction whose **perturbation
-latent space carries a conditional energy-based prior**, so that `a` (the perturbation)
+Implementation of Learning Perturbation-Specific Representations through Conditional Energy Prior for Cellular Response Prediction, so that `a` (the perturbation)
 and `z_a` (its representation) are directly coupled instead of being coupled only
 indirectly through a reconstruction loss.
 
